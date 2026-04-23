@@ -101,11 +101,13 @@ def run_bot_in_ephemeral_container(self, bot_id: int):
         # Check if we should keep containers for debugging
         auto_remove = os.getenv("BOT_CONTAINER_AUTO_REMOVE", "true").lower() != "false"
 
-        # Mount volumes (same as worker for code access)
-        # Get the host path - if we're in a container, use env var or detect from mounted volume
-        # The worker runs with .:/attendee mounted, so we need the host path
+        # Mount volumes (same as worker for code access).
+        # Upstream dev pattern: host checkout of the repo is bind-mounted into
+        # /attendee so code changes are picked up without rebuilding the image.
+        # In production the image already contains the code, so set
+        # BOT_HOST_CODE_PATH="" to skip the mount and use the baked-in /attendee.
         host_code_path = os.getenv("BOT_HOST_CODE_PATH", "/opt/attendee")
-        volumes = {host_code_path: {"bind": "/attendee", "mode": "rw"}}
+        volumes = {host_code_path: {"bind": "/attendee", "mode": "rw"}} if host_code_path else {}
 
         # Launch ephemeral container
         container = client.containers.run(
