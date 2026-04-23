@@ -70,7 +70,7 @@ class BotVideoOutputStream {
             );
         }
 
-        const blob = new Blob([buffer], { type: "image/png" });
+        const blob = new Blob([buffer], { type: this._detectImageType(buffer) });
         const url = URL.createObjectURL(blob);
         try {
             this.imageToDraw = await this._loadImage(url);
@@ -102,6 +102,14 @@ class BotVideoOutputStream {
         });
     }
 
+    _detectImageType(buffer) {
+        const bytes = new Uint8Array(buffer);
+        if (bytes[0] === 0xFF && bytes[1] === 0xD8 && bytes[2] === 0xFF) {
+            return "image/jpeg";
+        }
+        return "image/png";
+    }
+
     ensureInputOn() {
         try {
             this.turnOnInput && this.turnOnInput();
@@ -126,9 +134,10 @@ class BotVideoOutputStream {
      * Play a video (with audio) through the virtual webcam/mic.
      *
      * @param {string} videoUrl - URL of the video to play.
+     * @param {boolean} loop - Whether to loop the video.
      * @returns {Promise<void>}
      */
-    async playVideo(videoUrl) {
+    async playVideo(videoUrl, loop) {
         if (!videoUrl) {
             throw new Error("playVideo: videoUrl is required.");
         }
@@ -143,7 +152,7 @@ class BotVideoOutputStream {
 
         this.videoElement.muted = false;
         this.videoElement.src = videoUrl;
-        this.videoElement.loop = false;
+        this.videoElement.loop = loop;
         this.videoElement.autoplay = true;
         this.videoElement.crossOrigin = "anonymous";
 
@@ -177,6 +186,103 @@ class BotVideoOutputStream {
             }
         };
         this.videoElement.addEventListener('ended', this.videoEndedHandler);
+    }
+
+
+
+    /**
+     * Play a video by fetching it first and using a blob URL.
+     *
+     * Useful for environments with restrictive CSP (e.g., Teams).
+     *
+     * @param {string} videoUrl - URL of the video to play.
+     * @param {boolean} loop - Whether to loop the video.
+     * @returns {Promise<void>}
+     */
+    async playVideoWithBlobUrl(videoUrl, loop) {
+        if (!videoUrl) {
+            throw new Error("playVideoWithBlobUrl: videoUrl is required.");
+        }
+
+        this._stopVideoPlayback();
+        this._stopImageRedrawInterval();
+
+        if (!this.videoElement) {
+            this.videoElement = document.createElement("video");
+            this.videoElement.playsInline = true;
+        }
+
+        // Fetch video and create a blob URL to avoid CSP violations.
+        let videoBlobUrl = null;
+        try {
+            const response = await fetch(videoUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch video: ${response.status} ${response.statusText}`);
+            }
+
+            const contentLength = response.headers.get("content-length");
+            if (contentLength) {
+                const sizeMB = parseInt(contentLength, 10) / 1024 / 1024;
+                if (sizeMB > 100) {
+                    console.warn(
+                        `Large video detected (${Math.round(sizeMB * 100) / 100} MB). ` +
+                        "This will be loaded entirely into memory."
+                    );
+                    window.ws.sendJson({
+                        type: 'LargeVideoDetectedWarning',
+                        message: `In playVideoWithBlobUrl large video detected (${Math.round(sizeMB * 100) / 100} MB). This will be loaded entirely into memory.`
+                    });
+                }
+            }
+
+            const blob = await response.blob();
+            videoBlobUrl = URL.createObjectURL(blob);
+        } catch (fetchError) {
+            throw new Error(`Failed to fetch video for playback: ${fetchError.message}`);
+        }
+
+        this.videoBlobUrl = videoBlobUrl;
+
+        this.videoElement.muted = false;
+        this.videoElement.src = videoBlobUrl;
+        this.videoElement.loop = loop;
+        this.videoElement.autoplay = true;
+        this.videoElement.crossOrigin = "anonymous";
+
+        if (!this.videoAudioSource) {
+            // Create a Web Audio source for the video element
+            this.videoAudioSource =
+                this.getAudioContext().createMediaElementSource(this.videoElement);
+            this.videoAudioSource.connect(this.getGainNode());
+            // (Optional) also connect to speakers:
+            // this.videoAudioSource.connect(this.audioContext.destination);
+        }
+
+        if (this.getAudioContext().state === "suspended") {
+            await this.getAudioContext().resume();
+        }
+
+        await this.videoElement.play();
+        this.ensureInputOn();
+        this.ensureMicOn();
+
+        this._startVideoDrawingLoop();
+
+        // Add event listener for when video ends to display the last image
+        this.videoEndedHandler = () => {
+            // If we had an image, display it again keep the input on if not turn it off
+            if (this.lastImageBytes) {
+                this.displayImage(this.lastImageBytes);
+            }
+            else {
+                this.ensureInputOff();
+            }
+            if (this.videoBlobUrl) {
+                URL.revokeObjectURL(this.videoBlobUrl);
+                this.videoBlobUrl = null;
+            }
+        };
+        this.videoElement.addEventListener("ended", this.videoEndedHandler);
     }
 
 
@@ -228,6 +334,10 @@ class BotVideoOutputStream {
         if (this.videoRafId != null) {
             cancelAnimationFrame(this.videoRafId);
             this.videoRafId = null;
+        }
+        if (this.videoBlobUrl) {
+            URL.revokeObjectURL(this.videoBlobUrl);
+            this.videoBlobUrl = null;
         }
         if (this.videoElement) {
             this.videoElement.pause();
@@ -557,8 +667,12 @@ class BotOutputManager {
         return this.webcamVideoOutputStream.isVideoPlaying();
     }
 
-    async playVideo(videoUrl) {
-        return this.webcamVideoOutputStream.playVideo(videoUrl);
+    async playVideo(videoUrl, loop) {
+        return this.webcamVideoOutputStream.playVideo(videoUrl, loop);
+    }
+
+    async playVideoWithBlobUrl(videoUrl, loop) {
+        return this.webcamVideoOutputStream.playVideoWithBlobUrl(videoUrl, loop);
     }
 
     /**

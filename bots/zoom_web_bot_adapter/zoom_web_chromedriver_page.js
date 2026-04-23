@@ -17,6 +17,7 @@ var onBehalfToken = zoomInitialData.onBehalfToken;
 var leaveUrl = 'https://zoom.us';
 var userEnteredMeeting = false;
 var userEncounteredOnBehalfTokenUserNotInMeetingError = false;
+var userEncounteredGenericJoinError = false;
 var recordingPermissionGranted = false;
 var madeInitialRequestForRecordingPermission = false;
 var sentSaveCaptionNotAllowed = false;
@@ -71,6 +72,12 @@ function userHasEncounteredOnBehalfTokenUserNotInMeetingError() {
 }
 
 window.userHasEncounteredOnBehalfTokenUserNotInMeetingError = userHasEncounteredOnBehalfTokenUserNotInMeetingError;
+
+function userHasEncounteredGenericJoinError() {
+    return userEncounteredGenericJoinError;
+}
+
+window.userHasEncounteredGenericJoinError = userHasEncounteredGenericJoinError;
 
 function startMeeting(signature) {
 
@@ -148,6 +155,12 @@ function startMeeting(signature) {
                 console.log('join error');
                 console.log(error);
 
+                if (isGenericJoinError(error?.errorCode))
+                {
+                    userEncounteredGenericJoinError = true;
+                    return;
+                }
+
                 window.ws.sendJson({
                     type: 'MeetingStatusChange',
                     change: 'failed_to_join',
@@ -173,6 +186,8 @@ function startMeeting(signature) {
         */
         for (const activeSpeaker of data) {
             window.dominantSpeakerManager.addCaptionAudioTime(Date.now(), activeSpeaker.userId);
+            if (window.initialData.recordParticipantSpeechStartStopEvents)
+                window.participantSpeechStartStopManager?.addActiveSpeaker(activeSpeaker.userId);
         }
         // Use active speaker events to determine if we are silent or not
         window.ws.sendJson({
@@ -357,6 +372,10 @@ function startMeeting(signature) {
     });
 }
 
+function isGenericJoinError(code) {
+    return code == 1 && !userEnteredMeeting;
+}
+
 function handleJoinFailureFromConsoleIntercept(code, reason) {
     // Hacky way to determine if we are being rejected because the onbehalf token user is not in the meeting
     // There currently seems to be no specific error code for this.
@@ -364,6 +383,12 @@ function handleJoinFailureFromConsoleIntercept(code, reason) {
     {
         userEncounteredOnBehalfTokenUserNotInMeetingError = true;
         console.log('handleJoinFailureFromConsoleIntercept: user encountered onbehalf token user not in meeting error');
+        return;
+    }
+
+    if (isGenericJoinError(code))
+    {
+        userEncounteredGenericJoinError = true;
         return;
     }
 

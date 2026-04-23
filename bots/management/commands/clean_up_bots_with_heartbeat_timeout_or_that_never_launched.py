@@ -1,6 +1,7 @@
 import logging
 import os
 
+import docker
 from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import models
@@ -30,9 +31,12 @@ class Command(BaseCommand):
             logger.error(f"Failed to create fatal error {event_sub_type} event for bot {bot.id}: {str(e)}")
 
         # There isn't really a safe way to terminate the bot if it's running as a celery task
-        if not os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
-            return
+        if os.getenv("LAUNCH_BOT_METHOD") == "kubernetes":
+            self._terminate_kubernetes_pod(bot)
+        elif os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
+            self._terminate_ephemeral_docker_container(bot)
 
+    def _terminate_kubernetes_pod(self, bot):
         # Initialize kubernetes client
         try:
             config.load_incluster_config()
@@ -55,9 +59,51 @@ class Command(BaseCommand):
             if pod_error.status != 404:
                 logger.warning(f"Error deleting pod {pod_name}: {str(pod_error)}")
 
+    def _terminate_ephemeral_docker_container(self, bot):
+        """Remove the ephemeral Docker container for this bot (container name: bot-{id})."""
+        try:
+            client = docker.from_env()
+        except Exception as e:
+            logger.warning(f"Cannot connect to Docker to terminate bot {bot.id}: {e}")
+            return
+
+        container_name = bot.ephemeral_container_name()
+        try:
+            container = client.containers.get(container_name)
+            container.remove(force=True)
+            logger.info(f"Removed ephemeral container: {container_name}")
+        except docker.errors.NotFound:
+            # Container already gone, which is fine
+            pass
+        except Exception as e:
+            logger.warning(f"Error removing container {container_name}: {e}")
+
     def handle(self, *args, **options):
         self.terminate_bots_with_heartbeat_timeout()
+        self.terminate_bots_with_global_runtime_timeout()
         self.terminate_bots_that_never_launched()
+
+    def terminate_bots_with_global_runtime_timeout(self):
+        logger.info("Terminating bots with global runtime timeout...")
+        global_runtime_timeout_seconds = int(os.getenv("GLOBAL_BOT_RUNTIME_TIMEOUT_SECONDS", "108000"))
+
+        try:
+            runtime_q_filter = models.Q(first_heartbeat_timestamp__isnull=False) & models.Q(last_heartbeat_timestamp__isnull=False)
+            problem_bots = Bot.objects.filter(~BotEventManager.get_post_meeting_states_q_filter() & runtime_q_filter).annotate(runtime_seconds=models.F("last_heartbeat_timestamp") - models.F("first_heartbeat_timestamp")).filter(runtime_seconds__gt=global_runtime_timeout_seconds)
+
+            logger.info(f"Found {problem_bots.count()} bots with global runtime timeout")
+
+            for bot in problem_bots:
+                try:
+                    logger.info(f"Terminating bot {bot.object_id} due to global runtime timeout (runtime: {bot.runtime_seconds}s, limit: {global_runtime_timeout_seconds}s)")
+                    self.terminate_bot(bot, BotEventSubTypes.FATAL_ERROR_GLOBAL_RUNTIME_TIMEOUT)
+                except Exception as e:
+                    logger.error(f"Failed to terminate bot {bot.object_id}: {str(e)}")
+
+            logger.info("Finished terminating bots with global runtime timeout")
+
+        except client.ApiException as e:
+            logger.error(f"Failed to terminate bots with global runtime timeout: {str(e)}")
 
     def terminate_bots_with_heartbeat_timeout(self):
         logger.info("Terminating bots with heartbeat timeout...")

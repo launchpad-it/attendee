@@ -201,6 +201,74 @@ class BotModelRedactionSettingsTest(TransactionTestCase):
         self.assertEqual(result1, ["pii", "pci"])
 
 
+class BotModelDeepgramModelTest(TransactionTestCase):
+    """Unit tests for Bot model deepgram_model method."""
+
+    def setUp(self):
+        self.organization = Organization.objects.create(name="Test Org")
+        self.project = Project.objects.create(name="Test Project", organization=self.organization)
+
+    def _create_bot_with_settings(self, settings):
+        """Helper to create a bot with specific settings."""
+        return Bot.objects.create(project=self.project, meeting_url="https://zoom.us/j/test", settings=settings)
+
+    def test_deepgram_model_returns_nova3_by_default(self):
+        """Test that deepgram_model returns nova-3 by default."""
+        bot = self._create_bot_with_settings({})
+
+        result = bot.transcription_settings.deepgram_model()
+        self.assertEqual(result, "nova-3")
+
+    def test_deepgram_model_returns_nova3_for_english(self):
+        """Test that deepgram_model returns nova-3 for English language."""
+        bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"language": "en-US"}}})
+
+        result = bot.transcription_settings.deepgram_model()
+        self.assertEqual(result, "nova-3")
+
+    def test_deepgram_model_returns_nova3_for_other_languages(self):
+        """Test that deepgram_model returns nova-3 for languages supported by nova-3."""
+        for lang in ["es", "de", "fr", "ja", "ko", "pt", "ru"]:
+            bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"language": lang}}})
+            result = bot.transcription_settings.deepgram_model()
+            self.assertEqual(result, "nova-3", f"Expected nova-3 for language {lang}")
+
+    def test_deepgram_model_fallback_to_nova2_for_chinese_simplified(self):
+        """Test that deepgram_model falls back to nova-2 for Chinese Simplified."""
+        for lang in ["zh", "zh-CN", "zh-Hans"]:
+            bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"language": lang}}})
+            result = bot.transcription_settings.deepgram_model()
+            self.assertEqual(result, "nova-2", f"Expected nova-2 for language {lang}")
+
+    def test_deepgram_model_fallback_to_nova2_for_chinese_traditional(self):
+        """Test that deepgram_model falls back to nova-2 for Chinese Traditional."""
+        for lang in ["zh-TW", "zh-Hant", "zh-HK"]:
+            bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"language": lang}}})
+            result = bot.transcription_settings.deepgram_model()
+            self.assertEqual(result, "nova-2", f"Expected nova-2 for language {lang}")
+
+    def test_deepgram_model_fallback_to_nova2_for_thai(self):
+        """Test that deepgram_model falls back to nova-2 for Thai."""
+        for lang in ["th", "th-TH"]:
+            bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"language": lang}}})
+            result = bot.transcription_settings.deepgram_model()
+            self.assertEqual(result, "nova-2", f"Expected nova-2 for language {lang}")
+
+    def test_deepgram_model_settings_override_default(self):
+        """Test that explicit model in settings overrides default nova-3."""
+        bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"model": "nova-2-general"}}})
+
+        result = bot.transcription_settings.deepgram_model()
+        self.assertEqual(result, "nova-2-general")
+
+    def test_deepgram_model_settings_override_language_fallback(self):
+        """Test that explicit model in settings overrides language-based fallback."""
+        bot = self._create_bot_with_settings({"transcription_settings": {"deepgram": {"model": "nova-3", "language": "zh-CN"}}})
+
+        result = bot.transcription_settings.deepgram_model()
+        self.assertEqual(result, "nova-3")
+
+
 class DeepgramPrerecordedTranscriptionRedactionTest(TransactionTestCase):
     """Unit tests for pre-recorded transcription redaction integration."""
 
@@ -513,6 +581,7 @@ def _build_fake_deepgram(success=True, err_code=None):
 
     # ------------------------------------------------------------------ #
     # 3. Other names used in the provider
+    fake.DeepgramClientOptions = mock.Mock()
     fake.FileSource = dict
     fake.PrerecordedOptions = mock.Mock()
     return fake
@@ -597,6 +666,37 @@ class DeepgramProviderTest(TransactionTestCase):
                 "error_json": {"err_code": "SOME_OTHER"},
             },
         )
+
+    # ------------------------------------------------------------------ #
+    @mock.patch.dict("os.environ", {"DEEPGRAM_BASE_URL": "https://custom.deepgram-proxy.example.com"})
+    def test_custom_base_url_from_env(self):
+        """DEEPGRAM_BASE_URL env var → DeepgramClientOptions created with that URL."""
+        fake = _build_fake_deepgram(success=True)
+        transcription, failure = self._call_with_fake_module(fake)
+
+        self.assertIsNone(failure)
+        self.assertEqual(transcription, {"transcript": "hello"})
+
+        # DeepgramClientOptions should have been instantiated with the custom URL
+        fake.DeepgramClientOptions.assert_called_once_with(url="https://custom.deepgram-proxy.example.com")
+        # DeepgramClient should have received the options object as second arg
+        fake.DeepgramClient.assert_called_once_with("dg_key", fake.DeepgramClientOptions.return_value)
+
+    # ------------------------------------------------------------------ #
+    def test_eu_server_setting(self):
+        """use_eu_server=True → DeepgramClientOptions created with EU endpoint."""
+        self.bot.settings = {"transcription_settings": {"deepgram": {"use_eu_server": True}}}
+        self.bot.save()
+
+        fake = _build_fake_deepgram(success=True)
+        transcription, failure = self._call_with_fake_module(fake)
+
+        self.assertIsNone(failure)
+        self.assertEqual(transcription, {"transcript": "hello"})
+
+        # DeepgramClientOptions should have been instantiated with the EU URL
+        fake.DeepgramClientOptions.assert_called_once_with(url="https://api.eu.deepgram.com")
+        fake.DeepgramClient.assert_called_once_with("dg_key", fake.DeepgramClientOptions.return_value)
 
 
 from unittest import mock
@@ -1251,8 +1351,8 @@ class AssemblyAIProviderTest(TransactionTestCase):
             self.assertIsNone(failure)
             self.assertEqual(transcript["transcript"], "hello assembly")
 
-            # Check that the transcript creation request included keyterms_prompt and speech_model
-            # The second call to requests.post is the transcript creation
+            # Check that the transcript creation request included keyterms_prompt and speech_models
+            # The singular speech_model setting is mapped to the speech_models list
             transcript_call = m_post.call_args_list[1]
             _, kwargs = transcript_call
             data = kwargs["json"]
@@ -1260,6 +1360,108 @@ class AssemblyAIProviderTest(TransactionTestCase):
             self.assertEqual(data["keyterms_prompt"], ["aws", "azure", "google cloud"])
             self.assertIn("speech_model", data)
             self.assertEqual(data["speech_model"], "slam-1")
+            self.assertNotIn("speech_models", data)
+
+    def test_default_speech_models(self):
+        """Test that the default speech_models are included when no speech_model settings are configured."""
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+            mock.patch("bots.tasks.process_utterance_task.requests.delete") as m_delete,
+        ):
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+            m_post.side_effect = [upload_response, transcript_response]
+
+            done_response = mock.Mock(status_code=200)
+            done_response.json.return_value = {"status": "completed", "text": "hello", "words": []}
+            m_get.return_value = done_response
+            m_delete.return_value = mock.Mock(status_code=200)
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(failure)
+            transcript_call = m_post.call_args_list[1]
+            _, kwargs = transcript_call
+            data = kwargs["json"]
+            self.assertEqual(data["speech_models"], ["universal-3-pro", "universal-2"])
+
+    def test_speech_models_plural_overrides_default(self):
+        """Test that the speech_models (plural) setting overrides the default speech_models."""
+        self.bot.settings = {
+            "transcription_settings": {
+                "assembly_ai": {
+                    "speech_models": ["universal-2"],
+                }
+            }
+        }
+        self.bot.save()
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+            mock.patch("bots.tasks.process_utterance_task.requests.delete") as m_delete,
+        ):
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+            m_post.side_effect = [upload_response, transcript_response]
+
+            done_response = mock.Mock(status_code=200)
+            done_response.json.return_value = {"status": "completed", "text": "hello", "words": []}
+            m_get.return_value = done_response
+            m_delete.return_value = mock.Mock(status_code=200)
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(failure)
+            transcript_call = m_post.call_args_list[1]
+            _, kwargs = transcript_call
+            data = kwargs["json"]
+            self.assertEqual(data["speech_models"], ["universal-2"])
+
+    def test_speech_models_plural_overrides_singular(self):
+        """Test that speech_models (plural) takes precedence over speech_model (singular)."""
+        self.bot.settings = {
+            "transcription_settings": {
+                "assembly_ai": {
+                    "speech_model": "slam-1",
+                    "speech_models": ["universal-3-pro"],
+                }
+            }
+        }
+        self.bot.save()
+        with (
+            self._patch_creds(),
+            mock.patch("bots.tasks.process_utterance_task.pcm_to_mp3", return_value=b"mp3"),
+            mock.patch("bots.tasks.process_utterance_task.requests.post") as m_post,
+            mock.patch("bots.tasks.process_utterance_task.requests.get") as m_get,
+            mock.patch("bots.tasks.process_utterance_task.requests.delete") as m_delete,
+        ):
+            upload_response = mock.Mock(status_code=200)
+            upload_response.json.return_value = {"upload_url": "https://cdn.assemblyai.com/upload/123"}
+            transcript_response = mock.Mock(status_code=200)
+            transcript_response.json.return_value = {"id": "transcript-abc"}
+            m_post.side_effect = [upload_response, transcript_response]
+
+            done_response = mock.Mock(status_code=200)
+            done_response.json.return_value = {"status": "completed", "text": "hello", "words": []}
+            m_get.return_value = done_response
+            m_delete.return_value = mock.Mock(status_code=200)
+
+            transcript, failure = get_transcription_via_assemblyai(self.utterance)
+
+            self.assertIsNone(failure)
+            transcript_call = m_post.call_args_list[1]
+            _, kwargs = transcript_call
+            data = kwargs["json"]
+            self.assertEqual(data["speech_models"], ["universal-3-pro"])
 
 
 from unittest import mock

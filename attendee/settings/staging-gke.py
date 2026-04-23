@@ -7,7 +7,7 @@ from .base import *
 from .base import LOG_FORMATTERS
 
 DEBUG = False
-ALLOWED_HOSTS = ["*"]
+ALLOWED_HOSTS = os.getenv("ALLOWED_HOSTS", "*").split(",")
 
 DATABASES = {
     "default": dj_database_url.config(
@@ -44,7 +44,7 @@ ADMINS = []
 
 SERVER_EMAIL = "noreply@mail.attendee.dev"
 
-CSRF_TRUSTED_ORIGINS = ["https://*.attendee.dev"]
+CSRF_TRUSTED_ORIGINS = os.getenv("CSRF_TRUSTED_ORIGINS", "https://*.attendee.dev").split(",")
 
 LOGGING = {
     "version": 1,

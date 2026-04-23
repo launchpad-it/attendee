@@ -1,12 +1,22 @@
+import base64
+import json
 import signal
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from django.test import TestCase
 from django.utils import timezone as django_timezone
 
 from accounts.models import Organization
-from bots.management.commands.run_scheduler import Command
+from bots.management.commands.run_scheduler import CALENDAR_SYNC_THRESHOLD_HOURS, Command
 from bots.models import Bot, BotStates, Calendar, CalendarPlatform, CalendarStates, Project, ZoomOAuthApp, ZoomOAuthConnection, ZoomOAuthConnectionStates
+
+
+def _build_celery_unacked_entry(bot_id, join_at_iso):
+    """Build a mock Redis unacked hash entry matching the Celery message format."""
+    body = json.dumps([[bot_id, join_at_iso]])
+    encoded_body = base64.b64encode(body.encode()).decode()
+    message = [{"body": encoded_body, "headers": {"task": "bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot"}}]
+    return json.dumps(message).encode()
 
 
 class RunSchedulerCommandTestCase(TestCase):
@@ -90,14 +100,14 @@ class RunSchedulerCommandTestCase(TestCase):
             mock_enqueue.assert_not_called()
 
     def test_run_periodic_calendar_syncs_handles_boundary_conditions(self):
-        """Test calendar sync with calendars exactly at the 30 min boundary"""
-        # Calendar synced exactly 30 minutes ago (should be included)
-        exactly_30_minutes_ago = self.now - django_timezone.timedelta(minutes=30)
-        calendar_boundary = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=exactly_30_minutes_ago, client_id="test_client_id_boundary")
+        """Test calendar sync with calendars exactly at the threshold boundary"""
+        # Calendar synced exactly at threshold (should be included)
+        exactly_at_threshold = self.now - django_timezone.timedelta(hours=CALENDAR_SYNC_THRESHOLD_HOURS)
+        calendar_boundary = Calendar.objects.create(project=self.project, platform=CalendarPlatform.GOOGLE, state=CalendarStates.CONNECTED, sync_task_enqueued_at=exactly_at_threshold, client_id="test_client_id_boundary")
 
-        # Calendar synced just under 30 minutes ago (should be excluded)
-        just_under_30_minutes_ago = self.now - django_timezone.timedelta(minutes=29)
-        calendar_just_under = Calendar.objects.create(project=self.project, platform=CalendarPlatform.MICROSOFT, state=CalendarStates.CONNECTED, sync_task_enqueued_at=just_under_30_minutes_ago, client_id="test_client_id_under")
+        # Calendar synced just under threshold (should be excluded)
+        just_under_threshold = self.now - django_timezone.timedelta(hours=CALENDAR_SYNC_THRESHOLD_HOURS, minutes=-1)
+        calendar_just_under = Calendar.objects.create(project=self.project, platform=CalendarPlatform.MICROSOFT, state=CalendarStates.CONNECTED, sync_task_enqueued_at=just_under_threshold, client_id="test_client_id_under")
 
         command = Command()
 
@@ -112,7 +122,7 @@ class RunSchedulerCommandTestCase(TestCase):
         calendar_boundary.refresh_from_db()
         calendar_just_under.refresh_from_db()
         self.assertEqual(calendar_boundary.sync_task_enqueued_at, self.now)
-        self.assertEqual(calendar_just_under.sync_task_enqueued_at, just_under_30_minutes_ago)
+        self.assertEqual(calendar_just_under.sync_task_enqueued_at, just_under_threshold)
         self.assertEqual(calendar_just_under.sync_task_requested_at, None)
 
     def test_run_periodic_calendar_syncs_handles_requested_syncs(self):
@@ -288,3 +298,94 @@ class RunSchedulerCommandTestCase(TestCase):
         connection_just_under.refresh_from_db()
         self.assertEqual(connection_boundary.token_refresh_task_enqueued_at, self.now)
         self.assertEqual(connection_just_under.token_refresh_task_enqueued_at, just_under_30_days_ago)
+
+    def test_run_scheduled_bots_with_jitter_launches_immediately_below_threshold(self):
+        """Test that bots with join_at below the jitter start threshold are launched immediately via .delay()"""
+        jitter_start = 300
+        jitter_end = 600
+
+        # Bot within [now - 5min, now + jitter_start] should launch immediately
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Immediate Bot",
+            meeting_url="https://example.zoom.us/j/123456789",
+            state=BotStates.SCHEDULED,
+            join_at=self.now + django_timezone.timedelta(seconds=jitter_start - 60),
+        )
+
+        command = Command()
+        mock_redis = MagicMock()
+        mock_redis.hscan_iter.return_value = iter([])
+        command._redis_client = mock_redis
+
+        with patch.dict("os.environ", {"SCHEDULED_BOT_JITTER_START_SECONDS": str(jitter_start), "SCHEDULED_BOT_JITTER_END_SECONDS": str(jitter_end)}):
+            with patch("bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot.delay") as mock_delay:
+                with patch("bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot.apply_async") as mock_apply_async:
+                    with patch("django.utils.timezone.now", return_value=self.now):
+                        command._run_scheduled_bots_with_jitter()
+
+                    mock_delay.assert_called_once_with(bot.id, bot.join_at.isoformat())
+                    mock_apply_async.assert_not_called()
+
+    def test_run_scheduled_bots_with_jitter_launches_with_delay_above_threshold(self):
+        """Test that bots with join_at above the jitter start threshold are launched with apply_async and a countdown"""
+        jitter_start = 300
+        jitter_end = 600
+
+        # Bot within (now + jitter_start, now + jitter_end] should launch with random delay
+        bot_join_at = self.now + django_timezone.timedelta(seconds=jitter_start + 120)
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Jittered Bot",
+            meeting_url="https://example.zoom.us/j/123456789",
+            state=BotStates.SCHEDULED,
+            join_at=bot_join_at,
+        )
+
+        command = Command()
+        mock_redis = MagicMock()
+        mock_redis.hscan_iter.return_value = iter([])
+        command._redis_client = mock_redis
+
+        with patch.dict("os.environ", {"SCHEDULED_BOT_JITTER_START_SECONDS": str(jitter_start), "SCHEDULED_BOT_JITTER_END_SECONDS": str(jitter_end)}):
+            with patch("bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot.delay") as mock_delay:
+                with patch("bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot.apply_async") as mock_apply_async:
+                    with patch("django.utils.timezone.now", return_value=self.now):
+                        with patch("random.randint", return_value=42) as mock_randint:
+                            command._run_scheduled_bots_with_jitter()
+
+                    mock_delay.assert_not_called()
+                    mock_apply_async.assert_called_once_with(args=[bot.id, bot_join_at.isoformat()], countdown=42)
+                    # The max delay should be (bot.join_at - jitter_threshold).total_seconds() = 120 seconds
+                    mock_randint.assert_called_once_with(0, 120)
+
+    def test_run_scheduled_bots_with_jitter_skips_already_pending_bots(self):
+        """Test that bots already in pending launch tasks are skipped"""
+        jitter_start = 300
+        jitter_end = 600
+
+        bot = Bot.objects.create(
+            project=self.project,
+            name="Already Pending Bot",
+            meeting_url="https://example.zoom.us/j/123456789",
+            state=BotStates.SCHEDULED,
+            join_at=self.now + django_timezone.timedelta(seconds=60),
+        )
+
+        command = Command()
+        mock_redis = MagicMock()
+        mock_redis.hscan_iter.return_value = iter(
+            [
+                (b"delivery-tag-1", _build_celery_unacked_entry(bot.id, bot.join_at.isoformat())),
+            ]
+        )
+        command._redis_client = mock_redis
+
+        with patch.dict("os.environ", {"SCHEDULED_BOT_JITTER_START_SECONDS": str(jitter_start), "SCHEDULED_BOT_JITTER_END_SECONDS": str(jitter_end)}):
+            with patch("bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot.delay") as mock_delay:
+                with patch("bots.tasks.launch_scheduled_bot_task.launch_scheduled_bot.apply_async") as mock_apply_async:
+                    with patch("django.utils.timezone.now", return_value=self.now):
+                        command._run_scheduled_bots_with_jitter()
+
+                    mock_delay.assert_not_called()
+                    mock_apply_async.assert_not_called()

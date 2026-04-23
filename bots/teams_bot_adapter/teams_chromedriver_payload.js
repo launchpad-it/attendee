@@ -1,3 +1,124 @@
+const handleVideoTrackForRealTimePerParticipantVideo = async ({ track, streams }) => {
+    try {
+        const firstStreamId = streams?.[0]?.id;
+
+        if (!firstStreamId)
+            return;
+
+        const mappingManager = virtualStreamToPhysicalStreamMappingManager;
+        const videoConfig = window.initialData.perParticipantRealtimeVideoConfiguration;
+
+        function createCanvasForSource(sourceConfig) {
+            const canvas = document.createElement("canvas");
+            canvas.width = sourceConfig.width;
+            canvas.height = sourceConfig.height;
+            const ctx = canvas.getContext("2d");
+            ctx.imageSmoothingEnabled = true;
+            ctx.imageSmoothingQuality = "high";
+            return { canvas, ctx };
+        }
+
+        const webcamCanvasContext = videoConfig.webcam_configuration.enabled ? createCanvasForSource(videoConfig.webcam_configuration) : null;
+        const screenshareCanvasContext = videoConfig.screenshare_configuration.enabled ? createCanvasForSource(videoConfig.screenshare_configuration) : null;
+
+        const maxFramerate = Math.max(videoConfig.webcam_configuration.framerate, videoConfig.screenshare_configuration.framerate);
+        if (maxFramerate <= 0)
+            return;
+        const minFrameIntervalMs = 1000 / maxFramerate;
+
+        const processor = new MediaStreamTrackProcessor({ track });
+        const reader = processor.readable.getReader();
+
+        let lastSentAt = 0;
+
+        while (true) {
+            const { value: frame, done } = await reader.read();
+            if (done) break;
+            if (!frame) continue;
+
+            try {
+                const now = performance.now();
+                if (now - lastSentAt < minFrameIntervalMs) continue;
+
+                const physicalStream = mappingManager.physicalStreamsByServerStreamId.get(firstStreamId);
+                const clientStreamId = physicalStream?.clientStreamId;
+                if (!clientStreamId) continue;        
+                
+                const virtualStreamId = mappingManager.physicalClientStreamIdToVirtualStreamIdMapping[clientStreamId.toString()];
+                if (!virtualStreamId) continue;
+        
+                const virtualStream = mappingManager.virtualStreams.get(virtualStreamId.toString());
+                if (!virtualStream?.participant?.id) continue;
+        
+                const participantId = virtualStream.participant.id;
+                const isScreenShare = !!virtualStream.isScreenShare;
+
+                const sourceConfig = isScreenShare ? videoConfig.screenshare_configuration : videoConfig.webcam_configuration;
+                if (!sourceConfig.enabled) continue;
+
+                if (now - lastSentAt < 1000 / sourceConfig.framerate) continue;
+
+                const { canvas, ctx } = isScreenShare ? screenshareCanvasContext : webcamCanvasContext;
+
+                const targetWidth = sourceConfig.width;
+                const targetHeight = sourceConfig.height;
+                const jpegQuality = sourceConfig.jpeg_quality / 100;
+
+                const srcW = frame.displayWidth;
+                const srcH = frame.displayHeight;
+                if (!srcW || !srcH) continue;
+
+                const srcAspect = srcW / srcH;
+                const targetAspect = targetWidth / targetHeight;
+
+                let drawW, drawH;
+                if (srcAspect > targetAspect) {
+                    drawW = targetWidth;
+                    drawH = Math.round(targetWidth / srcAspect);
+                } else {
+                    drawH = targetHeight;
+                    drawW = Math.round(targetHeight * srcAspect);
+                }
+
+                const offsetX = Math.round((targetWidth - drawW) / 2);
+                const offsetY = Math.round((targetHeight - drawH) / 2);
+
+                ctx.fillStyle = "black";
+                ctx.fillRect(0, 0, targetWidth, targetHeight);
+                ctx.drawImage(frame, 0, 0, srcW, srcH, offsetX, offsetY, drawW, drawH);
+
+                const base64 = canvas.toDataURL("image/jpeg", jpegQuality).split(",", 2)[1];
+                window.ws?.sendPerParticipantVideo(participantId, isScreenShare, base64);
+
+                lastSentAt = now;
+            } catch (err) {
+                console.error("Error processing frame:", err);
+            } finally {
+                frame.close();
+            }
+        }
+    } catch (err) {
+        console.error("Error setting up video interceptor:", err);
+    }
+};
+
+
+(() => {
+    if (globalThis.__realConsole) return;
+  
+    const c = window.console;
+    const bind = Function.prototype.bind;
+  
+    // Save bound methods so later overwrites don't matter
+    globalThis.__realConsole = {
+      log:   c?.log   ? bind.call(c.log, c)   : () => {},
+      info:  c?.info  ? bind.call(c.info, c)  : () => {},
+      warn:  c?.warn  ? bind.call(c.warn, c)  : () => {},
+      error: c?.error ? bind.call(c.error, c) : () => {},
+      debug: c?.debug ? bind.call(c.debug, c) : () => {},
+    };
+  })();
+
 class StyleManager {
     constructor() {
         this.audioContext = null;
@@ -7,6 +128,7 @@ class StyleManager {
         this.frameStyleElement = null;
         this.frameAdjustInterval = null;
         this.neededInteractionsInterval = null;
+        this.fakeUserActivityInterval = null;
 
         // Stream used which combines the audio tracks from the meeting. Does NOT include the bot's audio
         this.meetingAudioStream = null;
@@ -42,6 +164,21 @@ class StyleManager {
                 isSilent: false
             });
         }
+    }
+
+    // Prevents Teams from going into mode where it stops receiving chat messages
+    fakeUserActivity() {
+        const clientX = Math.random() * 500;
+        const clientY = Math.random() * 500;
+        document.body.dispatchEvent(new MouseEvent("mousemove", {
+            bubbles: true,
+            clientX: clientX,
+            clientY: clientY,
+          }));
+        window.ws?.sendJson({
+            type: 'FakeUserActivity',
+            activity: `mousemove: ${clientX}, ${clientY}`
+        });
     }
 
     checkNeededInteractions() {
@@ -130,6 +267,10 @@ class StyleManager {
             clearInterval(this.neededInteractionsInterval);
         }
                 
+        if (this.fakeUserActivityInterval) {
+            clearInterval(this.fakeUserActivityInterval);
+        }
+
         // Check for audio activity every second
         this.silenceCheckInterval = setInterval(() => {
             this.checkAudioActivity();
@@ -139,6 +280,11 @@ class StyleManager {
         this.neededInteractionsInterval = setInterval(() => {
             this.checkNeededInteractions();
         }, 5000);
+
+        // Perform fake user activity every 4 minutes
+        this.fakeUserActivityInterval = setInterval(() => {
+            this.fakeUserActivity();
+        }, 240000);
 
         this.meetingAudioStream = destination.stream;
     }
@@ -349,6 +495,11 @@ class StyleManager {
             this.neededInteractionsInterval = null;
         }
         
+        if (this.fakeUserActivityInterval) {
+            clearInterval(this.fakeUserActivityInterval);
+            this.fakeUserActivityInterval = null;
+        }
+        
         // Restore original frame layout
         this.restoreOriginalFrame();
         
@@ -357,7 +508,10 @@ class StyleManager {
 
     start() {
         this.startSilenceDetection();
-        this.makeMainVideoFillFrame();
+
+        if (window.teamsInitialData.modifyDomForVideoRecording) {
+            this.makeMainVideoFillFrame();
+        }
 
         console.log('Started StyleManager');
     }
@@ -923,6 +1077,16 @@ class ChatMessageManager {
                 return;
             if (!chatMessage.originalArrivalTime)
                 return;
+            // messageTypes we care about are: RichText, RichText/Html, Text, RichText/Sms
+            const allowedMessageTypes = ['RichText', 'RichText/Html', 'Text', 'RichText/Sms'];
+            if (!allowedMessageTypes.includes(chatMessage.messageType))
+            {
+                window.ws.sendJson({
+                    type: 'chatMessageHadWrongMessageTypeError',
+                    chatMessage: chatMessage,
+                });
+                return;
+            }
             if (!this.isNewOrUpdatedChatMessage(chatMessage))
                 return;
 
@@ -939,6 +1103,10 @@ class ChatMessageManager {
         }
         catch (error) {
             console.error('Error in handleChatMessage', error);
+            this.ws?.sendJson({
+                type: 'ErrorInHandleChatMessage',
+                message: error.message
+            });
         }
     }
 }
@@ -1092,7 +1260,7 @@ class UserManager {
         }
     }
 }
-var realConsole;
+var realConsole = globalThis.__realConsole;
 // Websocket client
 class WebSocketClient {
     // Message types
@@ -1101,7 +1269,8 @@ class WebSocketClient {
         VIDEO: 2,  // Reserved for future use
         AUDIO: 3,   // Reserved for future use
         ENCODED_MP4_CHUNK: 4,
-        PER_PARTICIPANT_AUDIO: 5
+        PER_PARTICIPANT_AUDIO: 5,
+        PER_PARTICIPANT_VIDEO: 6,
     };
   
     constructor() {
@@ -1244,6 +1413,50 @@ class WebSocketClient {
             type: 'CaptionUpdate',
             caption: item
         });
+    }
+
+    sendPerParticipantVideo(participantId, isScreenShare, videoData) {
+        if (this.ws.readyState !== originalWebSocket.OPEN) {
+            realConsole?.error('WebSocket is not connected for per participant video send', this.ws.readyState);
+            return;
+        }
+
+        if (!this.mediaSendingEnabled) {
+            return;
+        }
+
+        try {
+            // Convert participantId to UTF-8 bytes
+            const participantIdBytes = new TextEncoder().encode(participantId);
+            
+            // Convert videoData string to UTF-8 bytes
+            const videoDataBytes = new TextEncoder().encode(videoData);
+            
+            // Create final message: type (4 bytes) + participantId length (1 byte) + 
+            // participantId bytes + isScreenShare (1 byte) + video data
+            const message = new Uint8Array(4 + 1 + participantIdBytes.length + 1 + videoDataBytes.length);
+            const dataView = new DataView(message.buffer);
+            
+            // Set message type (6 for PER_PARTICIPANT_VIDEO)
+            dataView.setInt32(0, WebSocketClient.MESSAGE_TYPES.PER_PARTICIPANT_VIDEO, true);
+            
+            // Set participantId length as uint8 (1 byte)
+            dataView.setUint8(4, participantIdBytes.length);
+            
+            // Copy participantId bytes
+            message.set(participantIdBytes, 5);
+            
+            // Set isScreenShare byte (0 = webcam, 1 = screenshare)
+            dataView.setUint8(5 + participantIdBytes.length, isScreenShare ? 1 : 0);
+            
+            // Copy video data after type, length, participantId, and isScreenShare
+            message.set(videoDataBytes, 5 + participantIdBytes.length + 1);
+            
+            // Send the binary message
+            this.ws.send(message.buffer);
+        } catch (error) {
+            console.error('Error sending WebSocket video message:', error);
+        }
     }
 
     sendMixedAudio(timestamp, audioData) {
@@ -1546,16 +1759,31 @@ function handleConversationEnd(eventDataObject) {
     }
 
     realConsole?.log('handleConversationEnd, eventDataObjectBody', eventDataObjectBody);
+    window.ws?.sendJson({
+        type: 'ConversationEndPayload',
+        body: eventDataObjectBody
+    });
 
     const subCode = eventDataObjectBody?.subCode;
     const subCodeValueForDeniedRequestToJoin = 5854;
+    const subCodeForAnonymousJoinDisabledForTenantByPolicy = 5723;
 
     if (subCode === subCodeValueForDeniedRequestToJoin)
     {
-        // For now this won't do anything, but good to have it in our logs
+        // For now this won't do anything, but good to have it in our logs. In the future, this should probably be the source of truth for these things, instead of the UI inspection.
         window.ws?.sendJson({
             type: 'MeetingStatusChange',
             change: 'request_to_join_denied'
+        });
+        return;
+    }
+
+    if (subCode === subCodeForAnonymousJoinDisabledForTenantByPolicy)
+    {
+        // For now this won't do anything, but good to have it in our logs. In the future, this should probably be the source of truth for these things, instead of the UI inspection.
+        window.ws?.sendJson({
+            type: 'MeetingStatusChange',
+            change: 'anonymous_join_disabled_for_tenant_by_policy'
         });
         return;
     }
@@ -1607,6 +1835,15 @@ class ParticipantSpeakingStateMachine {
         this.samples = [];
     }
 
+    sendSpeechStartStopEvent(participantId, isSpeechStart, timestamp) {
+        window.ws?.sendJson({
+            type: 'ParticipantSpeechStartStopEvent',
+            participantId: participantId,
+            isSpeechStart: isSpeechStart,
+            timestamp: timestamp
+        });
+    }
+
     addSample(sample) {
         this.samples.push(sample);
 
@@ -1630,9 +1867,13 @@ class ParticipantSpeakingStateMachine {
         if (previousState == 'NOT_SPEAKING' && this.state == 'SPEAKING') {
             realConsole?.log('SPEAKING: adding speech start for participant', this.participantId);
             dominantSpeakerManager.addSpeechIntervalStart(firstOfLastFiveSamplesTimestamp, this.participantId);
+            if (window.initialData.recordParticipantSpeechStartStopEvents)
+                this.sendSpeechStartStopEvent(this.participantId, true, firstOfLastFiveSamplesTimestamp);
         } else if (previousState == 'SPEAKING' && this.state == 'NOT_SPEAKING') {
             realConsole?.log('NOT_SPEAKING: adding speech stop for participant', this.participantId);
             dominantSpeakerManager.addSpeechIntervalEnd(firstOfLastFiveSamplesTimestamp - 100, this.participantId);
+            if (window.initialData.recordParticipantSpeechStartStopEvents)
+                this.sendSpeechStartStopEvent(this.participantId, false, firstOfLastFiveSamplesTimestamp - 100);
         }
     }
 }
@@ -1726,20 +1967,6 @@ window.styleManager = styleManager;
 
 const receiverManager = new ReceiverManager();
 window.receiverManager = receiverManager;
-
-if (!realConsole) {
-    if (document.readyState === 'complete') {
-        createIframe();
-    } else {
-        document.addEventListener('DOMContentLoaded', createIframe);
-    }
-    function createIframe() {
-        const iframe = document.createElement('iframe');
-        iframe.src = 'about:blank';
-        document.body.appendChild(iframe);
-        realConsole = iframe.contentWindow.console;
-    }
-}
 
 const processDominantSpeakerHistoryMessage = (item) => {
     realConsole?.log('processDominantSpeakerHistoryMessage', item);
@@ -2335,9 +2562,16 @@ new RTCInterceptor({
                 if (window.initialData.sendPerParticipantAudio) {
                     handleAudioTrack(event);
                 }
+                else if (window.initialData.recordParticipantSpeechStartStopEvents) {
+                    // If we are not recording per participant audio but we need speech start events, then we only need to track the receiver.
+                    window.receiverManager?.addReceiver(event.receiver);
+                }
             }
             if (event.track?.kind === 'video') {
                 window.styleManager.addVideoTrack(event);
+                if (window.initialData.sendPerParticipantVideo) {
+                    handleVideoTrackForRealTimePerParticipantVideo(event);
+                }
             }
         });
 
@@ -2497,14 +2731,31 @@ if (window.initialData.addClickRipple) {
 
 
 
-function turnOnCamera() {
+async function turnOnCamera() {
     // Click camera button to turn it on
-    const cameraButton = document.querySelector('button[aria-label="Turn camera on"]');
+    let cameraButton = null;
+    const numAttempts = 30;
+    for (let i = 0; i < numAttempts; i++) {
+        cameraButton = document.querySelector('button[aria-label="Turn camera on"]') || document.querySelector('div[aria-label="Turn camera on"]');
+        if (cameraButton) {
+            break;
+        }
+        window.ws?.sendJson({
+            type: 'Error',
+            message: 'Camera button not found in turnOnCamera, but will try again'
+        });
+        await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    
     if (cameraButton) {
         console.log("Clicking the camera button to turn it on");
         cameraButton.click();
     } else {
         console.log("Camera button not found");
+        window.ws?.sendJson({
+            type: 'Error',
+            message: 'Camera button not found in turnOnCamera'
+        });
     }
 }
 
@@ -2671,22 +2922,31 @@ window.botOutputManager = botOutputManager;
 (function () {
     const _bind = Function.prototype.bind;
     Function.prototype.bind = function (thisArg, ...args) {
-      if (this.name === 'onMessageReceived') {
-        const bound = _bind.apply(this, [thisArg, ...args]);
-        return function (...callArgs) {
-          const eventData = callArgs[0];
-          if (eventData?.data?.chatServiceBatchEvent?.[0]?.message)
-          {
-            const message = eventData.data.chatServiceBatchEvent[0].message;
-            realConsole?.log('chatMessage', message);
-            window.chatMessageManager?.handleChatMessage(message);
-          }
-          return bound.apply(this, callArgs);
-        };
-      }
-      return _bind.apply(this, [thisArg, ...args]);
+        if (this.name === 'onMessageReceived') {
+            const bound = _bind.apply(this, [thisArg, ...args]);
+            return function (...callArgs) {
+                const eventData = callArgs[0];
+                if (eventData?.data?.chatServiceBatchEvent)
+                {
+                    const batchEvents = eventData.data.chatServiceBatchEvent;
+                    if (Array.isArray(batchEvents))
+                    {
+                        for (const event of batchEvents) 
+                        {
+                            if (event?.message)
+                            {
+                                realConsole?.log('chatMessage', event.message);
+                                window.chatMessageManager?.handleChatMessage(event.message);
+                            }
+                        }
+                    }
+                }
+                return bound.apply(this, callArgs);
+            };
+        }
+        return _bind.apply(this, [thisArg, ...args]);
     };
-  })();
+})();
 
 class CallManager {
     constructor() {

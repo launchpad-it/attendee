@@ -54,6 +54,8 @@ from .models import (
     ZoomOAuthApp,
 )
 from .stripe_utils import credit_amount_for_purchase_amount_dollars, process_checkout_session_completed
+from .tasks.deliver_webhook_task import deliver_webhook
+from .usage_utils import get_usage_data
 from .utils import generate_recordings_json_for_bot_detail_view
 from .zoom_oauth_apps_api_utils import create_or_update_zoom_oauth_app
 
@@ -106,6 +108,14 @@ def get_google_meet_bot_login_for_user(user, google_meet_bot_login_object_id):
     if user.role != UserRole.ADMIN and not ProjectAccess.objects.filter(project=google_meet_bot_login.group.project, user=user).exists():
         raise PermissionDenied
     return google_meet_bot_login
+
+
+def get_webhook_delivery_attempt_for_user(user, idempotency_key):
+    webhook_delivery_attempt = get_object_or_404(WebhookDeliveryAttempt, idempotency_key=idempotency_key, webhook_subscription__project__organization=user.organization)
+    # If you're an admin you can access any webhook delivery attempt in the organization
+    if user.role != UserRole.ADMIN and not ProjectAccess.objects.filter(project=webhook_delivery_attempt.webhook_subscription.project, user=user).exists():
+        raise PermissionDenied
+    return webhook_delivery_attempt
 
 
 def get_webhook_options_for_project(project):
@@ -534,6 +544,39 @@ class ProjectBotsView(LoginRequiredMixin, ProjectUrlContextMixin, ListView):
         if search_query:
             queryset = queryset.filter(models.Q(object_id__icontains=search_query) | models.Q(meeting_url__icontains=search_query) | models.Q(name__icontains=search_query))
 
+        # Apply ended_at date filters if provided
+        ended_at_start = self.request.GET.get("ended_at_start")
+        ended_at_end = self.request.GET.get("ended_at_end")
+
+        if ended_at_start or ended_at_end:
+            ended_at_filters = {"bot_events__new_state__in": [BotStates.ENDED, BotStates.FATAL_ERROR]}
+            if ended_at_start:
+                ended_at_filters["bot_events__created_at__gte"] = ended_at_start
+            if ended_at_end:
+                from datetime import datetime, timedelta
+
+                try:
+                    ended_at_end_obj = datetime.strptime(ended_at_end, "%Y-%m-%d")
+                    ended_at_end_obj = ended_at_end_obj + timedelta(days=1)
+                    ended_at_filters["bot_events__created_at__lt"] = ended_at_end_obj
+                except (ValueError, TypeError):
+                    pass
+            queryset = queryset.filter(**ended_at_filters).distinct()
+
+        # Apply joined meeting filter if provided
+        joined_meeting = self.request.GET.get("joined_meeting", "").strip()
+        if joined_meeting == "yes":
+            queryset = queryset.filter(bot_events__event_type=BotEventTypes.BOT_JOINED_MEETING).distinct()
+        elif joined_meeting == "no":
+            queryset = queryset.exclude(bot_events__event_type=BotEventTypes.BOT_JOINED_MEETING)
+
+        # Apply unexpected error filter if provided
+        unexpected_error = self.request.GET.get("unexpected_error", "").strip()
+        if unexpected_error == "yes":
+            queryset = queryset.filter(bot_events__event_type=BotEventTypes.FATAL_ERROR).distinct()
+        elif unexpected_error == "no":
+            queryset = queryset.exclude(bot_events__event_type=BotEventTypes.FATAL_ERROR)
+
         # Get the latest bot event type and subtype for each bot using subquery annotations
         latest_event_subquery_base = BotEvent.objects.filter(bot=models.OuterRef("pk")).order_by("-created_at")
         latest_event_type = latest_event_subquery_base.values("event_type")[:1]
@@ -541,13 +584,6 @@ class ProjectBotsView(LoginRequiredMixin, ProjectUrlContextMixin, ListView):
 
         # Apply annotations and ordering
         queryset = queryset.annotate(last_event_type=models.Subquery(latest_event_type), last_event_sub_type=models.Subquery(latest_event_sub_type)).order_by("-created_at")
-
-        # Add display names for the event types
-        for bot in queryset:
-            if bot.last_event_type:
-                bot.last_event_type_display = dict(BotEventTypes.choices).get(bot.last_event_type, str(bot.last_event_type))
-            if bot.last_event_sub_type:
-                bot.last_event_sub_type_display = dict(BotEventSubTypes.choices).get(bot.last_event_sub_type, str(bot.last_event_sub_type))
 
         return queryset
 
@@ -564,13 +600,20 @@ class ProjectBotsView(LoginRequiredMixin, ProjectUrlContextMixin, ListView):
         context["session_type"] = self.get_session_type()
 
         # Add filter parameters to context for maintaining state
-        context["filter_params"] = {"start_date": self.request.GET.get("start_date", ""), "end_date": self.request.GET.get("end_date", ""), "join_at_start": self.request.GET.get("join_at_start", ""), "join_at_end": self.request.GET.get("join_at_end", ""), "states": self.request.GET.getlist("states"), "search": self.request.GET.get("search", "")}
+        context["filter_params"] = {"start_date": self.request.GET.get("start_date", ""), "end_date": self.request.GET.get("end_date", ""), "join_at_start": self.request.GET.get("join_at_start", ""), "join_at_end": self.request.GET.get("join_at_end", ""), "ended_at_start": self.request.GET.get("ended_at_start", ""), "ended_at_end": self.request.GET.get("ended_at_end", ""), "states": self.request.GET.getlist("states"), "search": self.request.GET.get("search", ""), "joined_meeting": self.request.GET.get("joined_meeting", ""), "unexpected_error": self.request.GET.get("unexpected_error", "")}
 
         # Add flag to detect if create modal should be automatically opened
         context["open_create_modal"] = self.request.GET.get("open_create_modal") == "true"
 
         # Check if any bots in the current page have a join_at value
         context["has_scheduled_bots"] = any(bot.join_at is not None for bot in context["bots"])
+
+        # Only iterates over the paginated page (<= 20)
+        for bot in context["bots"]:
+            if bot.last_event_type:
+                bot.last_event_type_display = dict(BotEventTypes.choices).get(bot.last_event_type, str(bot.last_event_type))
+            if bot.last_event_sub_type:
+                bot.last_event_sub_type_display = dict(BotEventSubTypes.choices).get(bot.last_event_sub_type, str(bot.last_event_sub_type))
 
         return context
 
@@ -767,16 +810,50 @@ class ProjectBotDetailView(LoginRequiredMixin, ProjectUrlContextMixin, View):
         # Calculate maximum values from resource snapshots
         max_ram_usage = 0
         max_cpu_usage = 0
+        max_db_connection_count = 0
+        max_redis_connection_count = 0
+        network_stats = None
+        public_ip = None
         if resource_snapshots.exists():
             for snapshot in resource_snapshots:
                 data = snapshot.data
-                ram_usage = data.get("ram_usage_megabytes", 0)
-                cpu_usage = data.get("cpu_usage_millicores", 0)
+                if public_ip is None:
+                    public_ip = data.get("public_ip")
+                ram_usage = data.get("ram_usage_megabytes") or 0
+                cpu_usage = data.get("cpu_usage_millicores") or 0
+                db_connection_count = data.get("db_connection_count") or 0
+                redis_connection_count = data.get("redis_connection_count") or 0
 
                 if ram_usage > max_ram_usage:
                     max_ram_usage = ram_usage
                 if cpu_usage > max_cpu_usage:
                     max_cpu_usage = cpu_usage
+                if db_connection_count > max_db_connection_count:
+                    max_db_connection_count = db_connection_count
+                if redis_connection_count > max_redis_connection_count:
+                    max_redis_connection_count = redis_connection_count
+
+                network = data.get("network")
+                if network:
+                    if network_stats is None:
+                        network_stats = {
+                            "max_rx_bytes_per_sec": 0,
+                            "max_tx_bytes_per_sec": 0,
+                            "max_rx_packets_per_sec": 0,
+                            "max_tx_packets_per_sec": 0,
+                            "total_rx_dropped": 0,
+                            "total_tx_dropped": 0,
+                            "total_rx_errors": 0,
+                            "total_tx_errors": 0,
+                        }
+                    network_stats["max_rx_bytes_per_sec"] = max(network_stats["max_rx_bytes_per_sec"], network.get("rx_bytes_per_sec") or 0)
+                    network_stats["max_tx_bytes_per_sec"] = max(network_stats["max_tx_bytes_per_sec"], network.get("tx_bytes_per_sec") or 0)
+                    network_stats["max_rx_packets_per_sec"] = max(network_stats["max_rx_packets_per_sec"], network.get("rx_packets_per_sec") or 0)
+                    network_stats["max_tx_packets_per_sec"] = max(network_stats["max_tx_packets_per_sec"], network.get("tx_packets_per_sec") or 0)
+                    network_stats["total_rx_dropped"] += network.get("rx_dropped_delta") or 0
+                    network_stats["total_tx_dropped"] += network.get("tx_dropped_delta") or 0
+                    network_stats["total_rx_errors"] += network.get("rx_errors_delta") or 0
+                    network_stats["total_tx_errors"] += network.get("tx_errors_delta") or 0
 
         context = self.get_project_context(object_id, project)
         context.update(
@@ -793,6 +870,10 @@ class ProjectBotDetailView(LoginRequiredMixin, ProjectUrlContextMixin, View):
                 "resource_snapshots": resource_snapshots,
                 "max_ram_usage": max_ram_usage,
                 "max_cpu_usage": max_cpu_usage,
+                "max_db_connection_count": max_db_connection_count,
+                "max_redis_connection_count": max_redis_connection_count,
+                "network_stats": network_stats,
+                "public_ip": public_ip,
             }
         )
 
@@ -1027,6 +1108,52 @@ class DeleteWebhookView(LoginRequiredMixin, ProjectUrlContextMixin, View):
         context["webhook_options"] = get_webhook_options_for_project(webhook.project)
         context["REQUIRE_HTTPS_WEBHOOKS"] = settings.REQUIRE_HTTPS_WEBHOOKS
         return render(request, "projects/project_webhooks.html", context)
+
+
+class ResendWebhookDeliveryAttemptView(LoginRequiredMixin, View):
+    def post(self, request, object_id, idempotency_key):
+        # Verify user has access to this project
+        get_project_for_user(user=request.user, project_object_id=object_id)
+
+        # Get and verify access to the webhook delivery attempt
+        webhook_delivery_attempt = get_webhook_delivery_attempt_for_user(
+            user=request.user,
+            idempotency_key=idempotency_key,
+        )
+
+        # Don't resend if the attempt count is greater than 49
+        if webhook_delivery_attempt.attempt_count > 49:
+            return HttpResponse(
+                '<span class="badge bg-secondary">Attempts exhausted</span>',
+                content_type="text/html",
+            )
+
+        # Only resend if the attempt is not pending
+        if webhook_delivery_attempt.status != WebhookDeliveryAttemptStatus.PENDING:
+            # Reset status to pending and queue for redelivery
+            webhook_delivery_attempt.status = WebhookDeliveryAttemptStatus.PENDING
+            webhook_delivery_attempt.save()
+
+            # Queue the webhook for delivery
+            deliver_webhook.delay(webhook_delivery_attempt.id)
+
+        # Return a simple confirmation badge - user can refresh page to see final status
+        return HttpResponse(
+            '<span class="badge bg-warning">Pending</span>',
+            content_type="text/html",
+        )
+
+
+class ProjectUsageView(AdminRequiredMixin, ProjectUrlContextMixin, View):
+    def get(self, request, object_id):
+        project = get_project_for_user(user=request.user, project_object_id=object_id)
+        interval = request.GET.get("interval", "months")
+        measure = request.GET.get("measure", "count")
+        platform = request.GET.get("platform", "")
+
+        context = self.get_project_context(object_id, project)
+        context.update(get_usage_data(project, interval, measure, platform))
+        return render(request, "projects/project_usage.html", context)
 
 
 class ProjectBillingView(AdminRequiredMixin, ProjectUrlContextMixin, ListView):

@@ -49,7 +49,9 @@ RUN apt-get update  \
 # Install Chrome dependencies
 RUN apt-get install -y xvfb x11-xkb-utils xfonts-100dpi xfonts-75dpi xfonts-scalable xfonts-cyrillic x11-apps libvulkan1 fonts-liberation xdg-utils wget
 # Install a specific version of Chrome.
-RUN wget -q http://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-stable/google-chrome-stable_134.0.6998.88-1_amd64.deb
+RUN wget -q https://mirror.cs.uchicago.edu/google-chrome/pool/main/g/google-chrome-stable/google-chrome-stable_134.0.6998.88-1_amd64.deb
+# Verify that the package is correct, since this is a mirror.
+RUN echo "df557edb3d24d8dcaff9557d80733b42afb6626685200d3f34a3b6f528065cad  google-chrome-stable_134.0.6998.88-1_amd64.deb" | sha256sum -c -
 RUN apt-get install -y ./google-chrome-stable_134.0.6998.88-1_amd64.deb
 
 # Install a specific version of ChromeDriver.
@@ -126,6 +128,12 @@ COPY --chown=app:app . .
 
 # Make STATIC_ROOT writeable for the non-root user so collectstatic can run at startup
 RUN mkdir -p "$cwd/staticfiles" && chown -R app:app "$cwd/staticfiles"
+
+# We want the app to be able to dynamically set the chrome policies file.
+# However, chrome will load the file from a hardcoded path in a directory that the app cannot write to.
+# Therefore, we create a symlink at that path that points to a file in /tmp which the app can write to.
+RUN mkdir -p /etc/opt/chrome/policies/managed \
+  && ln -s /tmp/attendee-chrome-policies.json /etc/opt/chrome/policies/managed/attendee-chrome-policies.json
 
 # Switch to non-root AFTER copies to avoid permission flakiness
 USER app

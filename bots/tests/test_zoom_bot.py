@@ -84,6 +84,8 @@ def create_mock_zoom_sdk():
     class MeetingFailCode:
         MEETING_FAIL_BLOCKED_BY_ACCOUNT_ADMIN = "100"
         MEETING_FAIL_UNABLE_TO_JOIN_EXTERNAL_MEETING = zoom.MeetingFailCode.MEETING_FAIL_UNABLE_TO_JOIN_EXTERNAL_MEETING
+        MEETING_FAIL_ENFORCE_LOGIN = zoom.MeetingFailCode.MEETING_FAIL_ENFORCE_LOGIN
+        MEETING_FAIL_APP_CAN_NOT_ANONYMOUS_JOIN_MEETING = zoom.MeetingFailCode.MEETING_FAIL_APP_CAN_NOT_ANONYMOUS_JOIN_MEETING
 
     base_mock.MeetingFailCode = MeetingFailCode
 
@@ -163,6 +165,8 @@ def create_mock_zoom_sdk():
     base_mock.MEETING_STATUS_CONNECTING = zoom.MeetingStatus.MEETING_STATUS_CONNECTING
     base_mock.MEETING_STATUS_INMEETING = zoom.MeetingStatus.MEETING_STATUS_INMEETING
     base_mock.MEETING_STATUS_ENDED = zoom.MeetingStatus.MEETING_STATUS_ENDED
+    base_mock.MEETING_STATUS_WEBINAR_PROMOTE = zoom.MeetingStatus.MEETING_STATUS_WEBINAR_PROMOTE
+    base_mock.MEETING_STATUS_WEBINAR_DEPROMOTE = zoom.MeetingStatus.MEETING_STATUS_WEBINAR_DEPROMOTE
     base_mock.LEAVE_MEETING = zoom.LeaveMeetingCmd.LEAVE_MEETING
     base_mock.AUTHRET_JWTTOKENWRONG = zoom.AuthResult.AUTHRET_JWTTOKENWRONG
 
@@ -1228,7 +1232,7 @@ class TestZoomBot(TransactionTestCase):
 
         # Create bot controller
         controller = BotController(self.bot.id)
-        controller.pipeline_configuration = PipelineConfiguration.audio_recorder_bot_with_websocket_audio()
+        controller.pipeline_configuration = PipelineConfiguration.audio_recorder_bot(websocket_stream_audio=True)
 
         # Run the bot in a separate thread since it has an event loop
         bot_thread = threading.Thread(target=controller.run)
@@ -2893,7 +2897,8 @@ class TestZoomBot(TransactionTestCase):
         # Mock the JWT token generation
         mock_jwt.encode.return_value = "fake_jwt_token"
 
-        # Setup bot with callback url
+        # Setup bot with callback url and registrant token in URL
+        self.bot.meeting_url = "https://zoom.us/j/123456789?pwd=password123&tk=registrant-token"
         self.bot.settings = {"callback_settings": {"zoom_tokens_url": "https://example.com/zoom-tokens"}}
         self.bot.save()
 
@@ -2950,6 +2955,7 @@ class TestZoomBot(TransactionTestCase):
         join_call_args = controller.adapter.meeting_service.Join.call_args
         join_param = join_call_args.args[0]
         self.assertEqual(join_param.param.userZAK, "fake_zak_token")
+        self.assertIsInstance(join_param.param.webinarToken, MagicMock)
         self.assertEqual(join_param.param.join_token, "fake_join_token")
         self.assertEqual(join_param.param.app_privilege_token, "fake_app_privilege_token")
         self.assertEqual(join_param.param.onBehalfToken, "fake_onbehalf_token")
@@ -3078,6 +3084,59 @@ class TestZoomBot(TransactionTestCase):
         self.assertIsInstance(join_param.param.app_privilege_token, MagicMock)
 
         # Cleanup
+        controller.cleanup()
+        bot_thread.join(timeout=5)
+
+    @patch("bots.external_callback_utils.requests.post")
+    @patch(
+        "bots.zoom_bot_adapter.video_input_manager.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.jwt")
+    @patch("bots.bot_controller.bot_controller.S3FileUploader")
+    def test_bot_sets_webinar_token_when_registrant_token_present_and_no_zak(
+        self,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        mock_zoom_sdk_video,
+        mock_requests_post,
+    ):
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        self.bot.meeting_url = "https://zoom.us/j/123456789?pwd=password123&tk=registrant-token"
+        self.bot.settings = {"callback_settings": {"zoom_tokens_url": "https://example.com/zoom-tokens"}}
+        self.bot.save()
+
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {}
+        mock_requests_post.return_value = mock_response
+
+        controller = BotController(self.bot.id)
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_auth_flow():
+            time.sleep(2)
+            if not hasattr(controller, "adapter") or not controller.adapter:
+                connection.close()
+                return
+            controller.adapter.auth_event.onAuthenticationReturnCallback(mock_zoom_sdk_adapter.AUTHRET_SUCCESS)
+            connection.close()
+
+        threading.Timer(1, simulate_auth_flow).start()
+        time.sleep(4)
+
+        controller.adapter.meeting_service.Join.assert_called_once()
+        join_param = controller.adapter.meeting_service.Join.call_args.args[0]
+        self.assertEqual(join_param.param.webinarToken, "registrant-token")
+        self.assertIsInstance(join_param.param.userZAK, MagicMock)
+
         controller.cleanup()
         bot_thread.join(timeout=5)
 
@@ -3506,13 +3565,6 @@ class TestZoomBot(TransactionTestCase):
             # Simulate video frame received
             adapter.video_input_manager.input_streams[0].renderer_delegate.onRawDataFrameReceivedCallback(MockVideoFrame())
 
-            # Simulate audio frame received
-            adapter.audio_source.onOneWayAudioRawDataReceivedCallback(
-                MockPCMAudioFrame(),
-                2,  # Simulated participant ID that's not the bot
-            )
-            adapter.audio_source.onMixedAudioRawDataReceivedCallback(MockPCMAudioFrame())
-
             # simulate audio mic initialized
             adapter.virtual_audio_mic_event_passthrough.onMicInitializeCallback(MagicMock())
 
@@ -3520,6 +3572,13 @@ class TestZoomBot(TransactionTestCase):
             adapter.virtual_audio_mic_event_passthrough.onMicStartSendCallback()
 
             time.sleep(2)
+
+            # Simulate audio frame received
+            adapter.audio_source.onOneWayAudioRawDataReceivedCallback(
+                MockPCMAudioFrame(),
+                2,  # Simulated participant ID that's not the bot
+            )
+            adapter.audio_source.onMixedAudioRawDataReceivedCallback(MockPCMAudioFrame())
 
             # Simulate chat message received
             adapter.on_chat_msg_notification_callback(mock_chat_msg_info, mock_chat_msg_info.GetContent())
@@ -3548,6 +3607,9 @@ class TestZoomBot(TransactionTestCase):
 
         # Give the bot some time to process
         bot_thread.join(timeout=11)
+
+        # Sleep for a tiny bit
+        time.sleep(2)
 
         # Verify that we received some data
         self.assertGreater(len(uploaded_data), 100, "Uploaded data length is not correct")
@@ -3856,6 +3918,9 @@ class TestZoomBot(TransactionTestCase):
 
         bot_thread.join(timeout=12)
 
+        # Sleep for a tiny bit
+        time.sleep(2)
+
         # Validate adapter resumed recording
         self.assertFalse(controller.adapter.recording_is_paused)
 
@@ -3988,6 +4053,9 @@ class TestZoomBot(TransactionTestCase):
         # Validate adapter resumed recording
         self.assertFalse(controller.adapter.recording_is_paused)
 
+        # Sleep for a tiny bit
+        time.sleep(2)
+
         self.bot.refresh_from_db()
 
         # Verify ordered event sequence and state transitions
@@ -4040,6 +4108,197 @@ class TestZoomBot(TransactionTestCase):
 
         # Close the database connection since we're in a thread
         connection.close()
+
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.VideoInputManager")
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("jwt.encode")
+    @patch("bots.bot_controller.bot_controller.S3FileUploader")
+    @patch("deepgram.DeepgramClient")
+    @patch("time.time")
+    def test_bot_auto_leaves_only_participant_with_bot_keywords(
+        self,
+        mock_time,
+        MockDeepgramClient,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        MockVideoInputManager,
+    ):
+        """
+        Test that the bot auto-leaves when only another bot (identified by bot_keywords) is in the meeting.
+        1. Real participant joins
+        2. Another bot (name matching bot_keywords) joins
+        3. Real participant leaves (timer should start, because the other bot is excluded)
+        4. Wait 8+ seconds - bot should leave (even though the other bot is still in the meeting)
+        """
+        # Set up Deepgram mock
+        MockDeepgramClient.return_value = create_mock_deepgram()
+
+        # Configure the mock uploader
+        mock_uploader = create_mock_file_uploader()
+        MockFileUploader.return_value = mock_uploader
+
+        # Mock the JWT token generation
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        # Mock VideoInputManager to avoid renderer creation issues
+        mock_video_input_manager = MagicMock()
+        mock_video_input_manager.set_mode = MagicMock()
+        mock_video_input_manager.cleanup = MagicMock()
+        MockVideoInputManager.return_value = mock_video_input_manager
+
+        # Set initial time
+        current_time = 1000.0
+        mock_time.return_value = current_time
+
+        # Create bot controller with bot_keywords configured
+        controller = BotController(self.bot.id)
+        controller.automatic_leave_configuration = AutomaticLeaveConfiguration(
+            only_participant_in_meeting_timeout_seconds=8,
+            silence_timeout_seconds=999999,  # Set very high so it doesn't interfere
+            silence_activate_after_seconds=999999,  # Set very high so it doesn't interfere
+            waiting_room_timeout_seconds=300,
+            wait_for_host_to_start_meeting_timeout_seconds=300,
+            max_uptime_seconds=None,
+            bot_keywords=["Notetaker", "Recording Bot"],  # Keywords to identify other bots
+        )
+
+        # Run the bot in a separate thread since it has an event loop
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_join_flow():
+            adapter = controller.adapter
+
+            # Simulate successful auth
+            adapter.auth_event.onAuthenticationReturnCallback(mock_zoom_sdk_adapter.AUTHRET_SUCCESS)
+
+            # Configure GetMeetingStatus to return the correct status
+            adapter.meeting_service.GetMeetingStatus.return_value = mock_zoom_sdk_adapter.MEETING_STATUS_CONNECTING
+
+            # Simulate connecting
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_CONNECTING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            # Update GetMeetingStatus to return in-meeting status
+            adapter.meeting_service.GetMeetingStatus.return_value = mock_zoom_sdk_adapter.MEETING_STATUS_INMEETING
+
+            # Simulate successful join
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_INMEETING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            # Wait for the video input manager to be set up
+            time.sleep(2)
+
+            # Create mock participants:
+            # ID 1 = Our bot
+            # ID 2 = Real participant (Test User)
+            # ID 3 = Another bot (Notetaker Bot - matches bot_keywords)
+            class MockParticipant:
+                def __init__(self, user_id, user_name, persistent_id, is_host=False):
+                    self._user_id = user_id
+                    self._user_name = user_name
+                    self._persistent_id = persistent_id
+                    self._is_host = is_host
+
+                def GetUserID(self):
+                    return self._user_id
+
+                def GetUserName(self):
+                    return self._user_name
+
+                def GetPersistentId(self):
+                    return self._persistent_id
+
+                def IsHost(self):
+                    return self._is_host
+
+            def get_user_by_id(user_id):
+                if user_id == 1:
+                    return MockParticipant(1, "Bot User", "bot_persistent_id")
+                elif user_id == 2:
+                    return MockParticipant(2, "Test User", "test_persistent_id_123")
+                elif user_id == 3:
+                    return MockParticipant(3, "REcOrding-Bot-for John", "notetaker_persistent_id")
+                return None
+
+            adapter.participants_ctrl.GetUserByUserID.side_effect = get_user_by_id
+
+            # Step 1: Real participant joins (participant ID = 2, bot ID = 1)
+            adapter.participants_ctrl.GetParticipantsList.return_value = [1, 2]
+            adapter.on_user_join_callback([2], [])
+
+            # Check auto-leave conditions - should not trigger (real participant is there)
+            adapter.check_auto_leave_conditions()
+            time.sleep(0.5)
+
+            # Step 2: Another bot joins (Notetaker - matches bot_keywords)
+            adapter.participants_ctrl.GetParticipantsList.return_value = [1, 2, 3]
+            adapter.on_user_join_callback([3], [])
+
+            # Check auto-leave conditions - should not trigger (real participant still there)
+            adapter.check_auto_leave_conditions()
+            time.sleep(0.5)
+
+            # Verify bot hasn't requested to leave yet
+            assert not adapter.requested_leave, "Bot should not have requested to leave yet"
+
+            # Step 3: Real participant leaves (only our bot and the other notetaker bot remain)
+            nonlocal current_time
+            adapter.participants_ctrl.GetParticipantsList.return_value = [1, 3]
+            adapter.on_user_left_callback([2], [])
+
+            # Check auto-leave conditions - timer should start (notetaker is excluded due to bot_keywords)
+            adapter.check_auto_leave_conditions()
+            time.sleep(0.5)
+
+            # Step 4: Advance time by 9 seconds (past the 8 second threshold)
+            current_time += 9
+            mock_time.return_value = current_time
+
+            # Check auto-leave conditions - should trigger auto-leave now
+            # (because the Notetaker bot is excluded from participant count)
+            adapter.check_auto_leave_conditions()
+            time.sleep(1)
+
+            # Update GetMeetingStatus to return ended status when meeting ends
+            adapter.meeting_service.GetMeetingStatus.return_value = mock_zoom_sdk_adapter.MEETING_STATUS_ENDED
+
+            # Simulate meeting ended after auto-leave
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_ENDED,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            # Clean up connections in thread
+            connection.close()
+
+        # Run join flow simulation after a short delay
+        threading.Timer(2, simulate_join_flow).start()
+
+        # Give the bot some time to process
+        bot_thread.join(timeout=20)
+
+        # Refresh the bot from the database
+        time.sleep(2)
+        self.bot.refresh_from_db()
+
+        # Assert that the bot is in the ENDED state
+        self.assertEqual(self.bot.state, BotStates.ENDED)
+
+        # Assert that the number of participants ever in meeting excluding other bots is 2
+        self.assertEqual(controller.adapter.number_of_participants_ever_in_meeting_excluding_other_bots(), 2)
+
+        # Verify that the bot auto-left due to being only participant
+        # (the other notetaker bot was excluded from the count)
+        bot_events = self.bot.bot_events.all()
+        auto_leave_events = [event for event in bot_events if event.event_sub_type == BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING]
+        self.assertEqual(len(auto_leave_events), 1, "Expected exactly one auto-leave event")
 
     @patch("bots.zoom_bot_adapter.zoom_bot_adapter.VideoInputManager")
     @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
@@ -4213,3 +4472,239 @@ class TestZoomBot(TransactionTestCase):
         bot_events = self.bot.bot_events.all()
         auto_leave_events = [event for event in bot_events if event.event_sub_type == BotEventSubTypes.LEAVE_REQUESTED_AUTO_LEAVE_ONLY_PARTICIPANT_IN_MEETING]
         self.assertEqual(len(auto_leave_events), 1, "Expected exactly one auto-leave event")
+
+    @patch(
+        "bots.zoom_bot_adapter.realtime_per_participant_video_frame_generator.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch(
+        "bots.zoom_bot_adapter.video_input_manager.zoom",
+        new_callable=create_mock_zoom_sdk,
+    )
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.zoom", new_callable=create_mock_zoom_sdk)
+    @patch("bots.zoom_bot_adapter.zoom_bot_adapter.jwt")
+    @patch("bots.bot_controller.bot_controller.S3FileUploader")
+    @patch("deepgram.DeepgramClient")
+    @patch("bots.bot_controller.bot_websocket_client_manager.BotWebsocketClient")
+    def test_bot_per_participant_video_streaming_via_websockets(
+        self,
+        MockBotWebsocketClient,
+        MockDeepgramClient,
+        MockFileUploader,
+        mock_jwt,
+        mock_zoom_sdk_adapter,
+        mock_zoom_sdk_video,
+        mock_zoom_sdk_video_generator,
+    ):
+        self.bot.settings = {
+            "recording_settings": {
+                "format": RecordingFormats.MP4,
+            },
+            "websocket_settings": {"per_participant_video": {"url": "wss://example.com/per-participant-video-stream"}},
+        }
+        self.bot.save()
+
+        MockDeepgramClient.return_value = create_mock_deepgram()
+
+        uploaded_data = bytearray()
+        mock_uploader = create_mock_file_uploader()
+
+        def capture_upload_part(file_path):
+            uploaded_data.extend(open(file_path, "rb").read())
+
+        mock_uploader.upload_file.side_effect = capture_upload_part
+        MockFileUploader.return_value = mock_uploader
+
+        mock_jwt.encode.return_value = "fake_jwt_token"
+
+        mock_websocket_client = MagicMock()
+        mock_websocket_client.started.return_value = True
+        mock_websocket_client.start.return_value = None
+        mock_websocket_client.cleanup.return_value = None
+        mock_websocket_client.websocket_url = "wss://example.com/per-participant-video-stream"
+
+        sent_messages = []
+
+        def capture_sent_message(message):
+            sent_messages.append(message)
+
+        mock_websocket_client.send_async.side_effect = capture_sent_message
+        MockBotWebsocketClient.return_value = mock_websocket_client
+
+        # Override GetUserByUserID so participant 2 has video on
+        mock_meeting_service = mock_zoom_sdk_adapter.CreateMeetingService()
+        mock_participants_controller = mock_meeting_service.GetMeetingParticipantsController()
+
+        class VideoOnParticipant:
+            def __init__(self, user_id, user_name, persistent_id, is_video_on):
+                self._user_id = user_id
+                self._user_name = user_name
+                self._persistent_id = persistent_id
+                self._is_video_on = is_video_on
+
+            def GetUserID(self):
+                return self._user_id
+
+            def GetUserName(self):
+                return self._user_name
+
+            def GetPersistentId(self):
+                return self._persistent_id
+
+            def IsHost(self):
+                return False
+
+            def IsVideoOn(self):
+                return self._is_video_on
+
+        mock_participants_controller.GetUserByUserID.side_effect = lambda uid: (VideoOnParticipant(1, "Bot User", "bot_persistent_id", False) if uid == 1 else VideoOnParticipant(2, "Test User", "test_persistent_id_123", True) if uid == 2 else None)
+        mock_participants_controller.GetMySelfUser.return_value = VideoOnParticipant(1, "Bot User", "bot_persistent_id", False)
+
+        controller = BotController(self.bot.id)
+        controller.pipeline_configuration = PipelineConfiguration.audio_recorder_bot(websocket_stream_per_participant_video=True)
+
+        bot_thread = threading.Thread(target=controller.run)
+        bot_thread.daemon = True
+        bot_thread.start()
+
+        def simulate_join_flow():
+            adapter = controller.adapter
+
+            adapter.auth_event.onAuthenticationReturnCallback(mock_zoom_sdk_adapter.AUTHRET_SUCCESS)
+
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_CONNECTING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_INMEETING,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            time.sleep(2)
+
+            adapter.audio_source.onOneWayAudioRawDataReceivedCallback(
+                MockPCMAudioFrame(),
+                2,
+            )
+
+            adapter.virtual_audio_mic_event_passthrough.onMicInitializeCallback(MagicMock())
+            adapter.virtual_audio_mic_event_passthrough.onMicStartSendCallback()
+
+            mock_suggest_cap = MagicMock()
+            mock_suggest_cap.width = 640
+            mock_suggest_cap.height = 480
+            mock_suggest_cap.frame = 30
+            adapter.virtual_camera_video_source.onInitializeCallback(MagicMock(), [], mock_suggest_cap)
+            adapter.virtual_camera_video_source.onStartSendCallback()
+
+            time.sleep(1)
+
+            # Set up screen sharing mock so the generator creates a screenshare subscription
+            mock_sharing_info = MagicMock()
+            mock_sharing_info.userid = 2
+            mock_sharing_info.shareSourceID = 42
+            adapter.meeting_sharing_controller.GetViewableSharingUserList.return_value = [2]
+            adapter.meeting_sharing_controller.GetSharingSourceInfoList.return_value = [mock_sharing_info]
+
+            # Trigger the generator's subscription refresh which discovers participants
+            # with video on and active screen sharers, then creates renderer subscriptions
+            generator = adapter.realtime_per_participant_video_frame_generator
+            generator._do_refresh_subscriptions()
+
+            webcam_subscription = generator._subscriptions.get((2, None))
+            screenshare_subscription = generator._subscriptions.get((2, 42))
+
+            # Simulate raw I420 video frames arriving on each subscription's renderer
+            # callback. This exercises _scale_i420_to_jpeg (I420 → JPEG conversion),
+            # _emit_frame (base64 encoding), and the websocket delivery path.
+            webcam_subscription._on_raw_video_frame_received(MockVideoFrame())
+            screenshare_subscription._on_raw_video_frame_received(MockVideoFrame())
+
+            time.sleep(1)
+
+            adapter.meeting_service_event.onMeetingStatusChangedCallback(
+                mock_zoom_sdk_adapter.MEETING_STATUS_ENDED,
+                mock_zoom_sdk_adapter.SDKERR_SUCCESS,
+            )
+
+            time.sleep(5)
+
+            connection.close()
+
+        threading.Timer(3, simulate_join_flow).start()
+
+        bot_thread.join(timeout=15)
+
+        self.bot.refresh_from_db()
+        self.assertEqual(self.bot.state, BotStates.ENDED)
+
+        # Verify the adapter created a RealtimePerParticipantVideoFrameGenerator
+        self.assertIsNotNone(controller.adapter.realtime_per_participant_video_frame_generator)
+
+        # Verify websocket client was created with the correct URL
+        MockBotWebsocketClient.assert_called_once()
+        websocket_call_args = MockBotWebsocketClient.call_args
+        self.assertEqual(websocket_call_args[1]["url"], "wss://example.com/per-participant-video-stream")
+        self.assertIsNotNone(websocket_call_args[1]["on_message_callback"])
+
+        # Verify both per-participant video messages were sent
+        self.assertEqual(len(sent_messages), 2, "Expected two per-participant video messages sent via websocket")
+
+        webcam_message = sent_messages[0]
+        self.assertEqual(webcam_message["trigger"], "realtime_video.per_participant")
+        self.assertEqual(webcam_message["bot_id"], self.bot.object_id)
+        self.assertIn("data", webcam_message)
+        self.assertEqual(webcam_message["data"]["participant_uuid"], "2")
+        self.assertEqual(webcam_message["data"]["format"], "jpeg")
+        self.assertEqual(webcam_message["data"]["source"], "webcam")
+        self.assertIn("frame", webcam_message["data"])
+        self.assertGreater(len(webcam_message["data"]["frame"]), 0)
+
+        # Verify the frame produced by _scale_i420_to_jpeg is a valid JPEG
+        decoded_webcam_frame = base64.b64decode(webcam_message["data"]["frame"])
+        self.assertEqual(decoded_webcam_frame[:2], b"\xff\xd8", "Webcam frame should start with JPEG SOI marker")
+        self.assertEqual(decoded_webcam_frame[-2:], b"\xff\xd9", "Webcam frame should end with JPEG EOI marker")
+
+        screenshare_message = sent_messages[1]
+        self.assertEqual(screenshare_message["trigger"], "realtime_video.per_participant")
+        self.assertEqual(screenshare_message["data"]["source"], "screenshare")
+        self.assertEqual(screenshare_message["data"]["participant_uuid"], "2")
+
+        decoded_screenshare_frame = base64.b64decode(screenshare_message["data"]["frame"])
+        self.assertEqual(decoded_screenshare_frame[:2], b"\xff\xd8", "Screenshare frame should start with JPEG SOI marker")
+        self.assertEqual(decoded_screenshare_frame[-2:], b"\xff\xd9", "Screenshare frame should end with JPEG EOI marker")
+
+        # Verify bot events
+        bot_events = self.bot.bot_events.all()
+        self.assertGreaterEqual(len(bot_events), 5)
+
+        self.assertEqual(bot_events[0].event_type, BotEventTypes.JOIN_REQUESTED)
+        self.assertEqual(bot_events[0].old_state, BotStates.READY)
+        self.assertEqual(bot_events[0].new_state, BotStates.JOINING)
+
+        self.assertEqual(bot_events[1].event_type, BotEventTypes.BOT_JOINED_MEETING)
+        self.assertEqual(bot_events[1].old_state, BotStates.JOINING)
+        self.assertEqual(bot_events[1].new_state, BotStates.JOINED_NOT_RECORDING)
+
+        self.assertEqual(bot_events[2].event_type, BotEventTypes.BOT_RECORDING_PERMISSION_GRANTED)
+        self.assertEqual(bot_events[2].old_state, BotStates.JOINED_NOT_RECORDING)
+        self.assertEqual(bot_events[2].new_state, BotStates.JOINED_RECORDING)
+
+        post_processing_completed_event = bot_events[len(bot_events) - 1]
+        self.assertEqual(post_processing_completed_event.event_type, BotEventTypes.POST_PROCESSING_COMPLETED)
+        self.assertEqual(post_processing_completed_event.new_state, BotStates.ENDED)
+
+        # Verify recording was completed
+        self.recording.refresh_from_db()
+        self.assertEqual(self.recording.state, RecordingStates.COMPLETE)
+
+        mock_uploader.upload_file.assert_called_once()
+        mock_uploader.wait_for_upload.assert_called_once()
+        mock_uploader.delete_file.assert_called_once()
+
+        controller.cleanup()
+        bot_thread.join(timeout=5)
+
+        connection.close()
