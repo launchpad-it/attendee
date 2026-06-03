@@ -609,6 +609,29 @@ class WebBotAdapter(BotAdapter):
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
 
+        # CARRY-PATCH (launchpad-it fork): route the browser's egress through a
+        # proxy so the bot presents a different IP than the host. Google Meet
+        # blocks joins from flagged datacenter IPs ("You can't join this video
+        # call" -> UiGoogleBlockingUsException); see attendee-labs/attendee#841,
+        # where the maintainer confirms the block is IP-based. Upstream has no
+        # proxy feature (they fix IP at the infra layer via k8s pod churn), so
+        # we add a Chrome-scoped one here.
+        #
+        # Scope: --proxy-server applies to Chrome ONLY. The worker's own egress
+        # (Postgres, R2, Deepgram, internal API) stays direct — do NOT use
+        # HTTP(S)_PROXY env, which Chrome ignores anyway and would wrongly
+        # tunnel the control plane.
+        #
+        # Auth: Chrome can't answer a proxy auth dialog headless, so the proxy
+        # must use IP-whitelist auth (allow the host IP) rather than user:pass.
+        # Value example: "http://gw.provider.com:7000" or "socks5://host:port"
+        # (SOCKS5 also carries WebRTC/UDP media; an HTTP proxy only covers the
+        # join/signaling traffic, which is where the block occurs).
+        bot_proxy_server = os.getenv("BOT_PROXY_SERVER")
+        if bot_proxy_server:
+            options.add_argument(f"--proxy-server={bot_proxy_server}")
+            logger.info(f"Routing bot browser through proxy: {bot_proxy_server}")
+
         if os.getenv("ENABLE_CHROME_SANDBOX", "false").lower() != "true":
             options.add_argument("--no-sandbox")
             options.add_argument("--disable-setuid-sandbox")
