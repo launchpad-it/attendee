@@ -1820,8 +1820,17 @@ class BotController:
                 return
 
             logger.info("Received message that we were blocked by platform repeatedly, so recreating pod")
-            # Run task to restart the bot pod with 1 minute delay
-            restart_bot_pod.apply_async(args=[self.bot_in_db.id], countdown=60)
+            if os.getenv("LAUNCH_BOT_METHOD") == "docker-compose-multi-host":
+                # restart_bot_pod only knows Kubernetes; with ephemeral containers it can
+                # never relaunch, and the bot would sit in "joining" with nothing running.
+                # The launcher waits for this container to exit, so a short delay is enough.
+                from bots.tasks.restart_bot_in_ephemeral_container_task import restart_bot_in_ephemeral_container
+
+                restart_delay_seconds = int(os.getenv("EPHEMERAL_BOT_RESTART_DELAY_SECONDS", "5"))
+                restart_bot_in_ephemeral_container.apply_async(args=[self.bot_in_db.id], countdown=restart_delay_seconds, queue="bot_launcher_vm")
+            else:
+                # Run task to restart the bot pod with 1 minute delay
+                restart_bot_pod.apply_async(args=[self.bot_in_db.id], countdown=60)
             # Don't do the normal cleanup tasks because we'll be restarting the pod
             if self.main_loop and self.main_loop.is_running():
                 logger.info("Quitting main loop")

@@ -38,6 +38,11 @@ class UiGoogleWrongAudioConfigurationException(UiRetryableExpectedException):
 
 
 class UiMocapSequenceNotAvailableException(UiRetryableExpectedException):
+    # No recorded mouse path reaches the button from where the pointer is. That is a
+    # property of the layout, not a sign Google is blocking us, and it happens on
+    # almost every join (the stretched-path fallback only kicks in after two).
+    indicates_platform_blocking = False
+
     def __init__(self, message, step=None, inner_exception=None):
         super().__init__(message, step, inner_exception)
 

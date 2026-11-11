@@ -50,6 +50,12 @@ class UiAuthorizedUserNotInMeetingTimeoutExceededException(UiException):
 
 
 class UiRetryableExpectedException(UiRetryableException):
+    # Whether this failure is evidence that the platform is blocking the bot. Only
+    # such failures count toward BLOCKED_BY_PLATFORM_REPEATEDLY in
+    # WebBotAdapter.repeatedly_attempt_to_join_meeting; the others get a bounded
+    # free allowance first (MAX_UNCOUNTED_EXPECTED_EXCEPTIONS).
+    indicates_platform_blocking = True
+
     def __init__(self, message, step=None, inner_exception=None):
         super().__init__(message, step, inner_exception)
 
