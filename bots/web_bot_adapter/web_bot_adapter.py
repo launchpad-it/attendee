@@ -29,6 +29,11 @@ from .ui_methods import UiAuthorizedUserNotInMeetingTimeoutExceededException, Ui
 
 logger = logging.getLogger(__name__)
 
+# How many expected join failures that do NOT indicate platform blocking (see
+# UiRetryableExpectedException.indicates_platform_blocking) a join may absorb before
+# they start counting toward BLOCKED_BY_PLATFORM_REPEATEDLY like any other.
+MAX_UNCOUNTED_EXPECTED_EXCEPTIONS = 5
+
 
 class WebBotAdapter(BotAdapter):
     def __init__(
@@ -735,6 +740,7 @@ class WebBotAdapter(BotAdapter):
 
         # Expected exceptions are ones that we expect to happen and are not a big deal, so we only increment num_retries once every three expected exceptions
         num_expected_exceptions = 0
+        num_uncounted_expected_exceptions = 0
         num_retries = 0
         max_retries = 3
         attempts_to_join_started_at = time.time()
@@ -803,15 +809,23 @@ class WebBotAdapter(BotAdapter):
                     self.send_debug_screenshot_message(step=e.step, exception=e, inner_exception=e.inner_exception)
                     return
 
-                num_expected_exceptions += 1
-                if num_expected_exceptions % 5 == 0:
-                    num_retries += 1
-                    logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred, so incrementing num_retries. This usually indicates that the meeting has not started yet, so we will wait for the configured amount of time which is 180 seconds before retrying")
-                    # We're going to start a new pod to see if that fixes the issue
-                    self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY})
-                    return
+                # A failure that says nothing about the platform blocking us (e.g. no mouse
+                # path to the button) must not push the bot over the blocked-by-platform
+                # limit: two of them plus three real blocks used to end the join attempt.
+                # The allowance is bounded so a failure that never resolves still ends.
+                if not e.indicates_platform_blocking and num_uncounted_expected_exceptions < MAX_UNCOUNTED_EXPECTED_EXCEPTIONS:
+                    num_uncounted_expected_exceptions += 1
+                    logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and does not indicate platform blocking, so not counting it ({num_uncounted_expected_exceptions}/{MAX_UNCOUNTED_EXPECTED_EXCEPTIONS} uncounted so far)")
                 else:
-                    logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries, but {num_expected_exceptions} expected exceptions have occurred")
+                    num_expected_exceptions += 1
+                    if num_expected_exceptions % 5 == 0:
+                        num_retries += 1
+                        logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected and {num_expected_exceptions} expected exceptions have occurred, so incrementing num_retries. This usually indicates that the meeting has not started yet, so we will wait for the configured amount of time which is 180 seconds before retrying")
+                        # We're going to start a new pod to see if that fixes the issue
+                        self.send_message_callback({"message": self.Messages.BLOCKED_BY_PLATFORM_REPEATEDLY})
+                        return
+                    else:
+                        logger.info(f"Failed to join meeting and the {e.__class__.__name__} exception is expected so not incrementing num_retries, but {num_expected_exceptions} expected exceptions have occurred")
 
             except UiRetryableException as e:
                 if num_retries >= max_retries:
